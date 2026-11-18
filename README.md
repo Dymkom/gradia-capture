@@ -23,7 +23,7 @@ Includes features like annotations, custom saving options and integration with t
 > The [GNOME Code of Conduct](https://conduct.gnome.org) applies to this project, including this repository.
 
 ## Plans for fork
-- [ ] Remove hardcoded save paths and filenames in favor of system defaults matching the user's locale.
+- [x] Remove hardcoded save paths and filenames in favor of system defaults matching the user's locale.
 - [ ] Add support for non-Latin keyboard layouts.
 - [ ] Try resolve issues from the original Gradia extension.
 - [ ] Redesign preferences.
@@ -40,7 +40,7 @@ Includes features like annotations, custom saving options and integration with t
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/AlexanderVanhee/gradia-capture.git
+git clone https://github.com/Dymkom/gradia-capture.git
 cd gradia-capture
 ```
 

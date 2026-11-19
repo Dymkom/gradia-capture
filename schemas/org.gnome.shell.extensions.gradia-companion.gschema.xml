@@ -21,5 +21,25 @@
       <default>true</default>
       <summary>Composite transient windows when capturing a window screenshot</summary>
     </key>
+    <key name="gradia-undo" type="as">
+      <default><![CDATA[['<Control>z']]]></default>
+      <summary>Undo last stroke shortcut</summary>
+      <description>Keyboard shortcut that undoes the last annotation while the screenshot UI is open</description>
+    </key>
+    <key name="gradia-copy" type="as">
+      <default><![CDATA[['<Control>c']]]></default>
+      <summary>Copy to clipboard shortcut</summary>
+      <description>Keyboard shortcut that copies the annotated screenshot and closes the screenshot UI</description>
+    </key>
+    <key name="gradia-save-as" type="as">
+      <default><![CDATA[['<Control>s']]]></default>
+      <summary>Save As shortcut</summary>
+      <description>Keyboard shortcut that opens the Save As dialog for the annotated screenshot</description>
+    </key>
+    <key name="gradia-ocr" type="as">
+      <default><![CDATA[['<Control>e']]]></default>
+      <summary>Extract text (OCR) shortcut</summary>
+      <description>Keyboard shortcut that sends the screenshot to Gradia for text extraction</description>
+    </key>
   </schema>
 </schemalist>

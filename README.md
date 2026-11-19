@@ -24,7 +24,7 @@ Includes features like annotations, custom saving options and integration with t
 
 ## Plans for fork
 - [x] Remove hardcoded save paths and filenames in favor of system defaults matching the user's locale.
-- [ ] Add support for non-Latin keyboard layouts.
+- [x] Add support for non-Latin keyboard layouts.
 - [ ] Try resolve issues from the original Gradia extension.
 - [ ] Redesign preferences.
 - [ ] Make top-bar/panel UI elements optional.

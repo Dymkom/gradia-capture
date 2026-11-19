@@ -205,19 +205,55 @@ const AboutPage = GObject.registerClass(
         }
     });
 
+let _shortcutCssLoaded = false;
+
+function ensureShortcutCss() {
+    if (_shortcutCssLoaded)
+        return;
+    const provider = new Gtk.CssProvider();
+    provider.load_from_string('.gradia-shortcut-status .icon { -gtk-icon-size: 48px; }');
+    Gtk.StyleContext.add_provider_for_display(
+        Gdk.Display.get_default(),
+        provider,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+    );
+    _shortcutCssLoaded = true;
+}
+
+// Map keycode to its physical Latin keyval so shortcuts recorded on non-Latin
+// layouts stay layout-independent.
+function latinKeyval(keyval, keycode) {
+    if (keyval >= 0x20 && keyval <= 0x7e)
+        return keyval;
+    try {
+        const [ok, , keyvals] = Gdk.Display.get_default().map_keycode(keycode);
+        if (ok) {
+            const latin = keyvals.find(v => (v >= 0x61 && v <= 0x7a) || (v >= 0x30 && v <= 0x39));
+            if (latin)
+                return latin;
+        }
+    } catch (_e) {
+        // Fall back to the original keyval.
+    }
+    return keyval;
+}
+
 const ShortcutsPage = GObject.registerClass(
     class ShortcutsPage extends Adw.PreferencesPage {
-        constructor() {
+        constructor(settings) {
             super({
                 title: 'Shortcuts',
                 icon_name: 'preferences-desktop-keyboard-shortcuts-symbolic',
             });
 
+            this._settings = settings;
+            ensureShortcutCss();
+
             this._addGroup('Screenshot Mode', [
                 ['Take Screenshot / Capture',  'Return space'],
-                ['Copy to Clipboard',          '<Control>c'],
-                ['Save As…',                   '<Control>s'],
-                ['Extract Text (OCR)',         '<Control>e'],
+                ['Copy to Clipboard',          '<Control>c', 'gradia-copy'],
+                ['Save As…',                   '<Control>s', 'gradia-save-as'],
+                ['Extract Text (OCR)',         '<Control>e', 'gradia-ocr'],
                 ['Area Selection',             's'],
                 ['Screen Selection',           'c'],
                 ['Window Selection',           'w'],
@@ -228,7 +264,7 @@ const ShortcutsPage = GObject.registerClass(
             ]);
 
             this._addGroup('Annotations', [
-                ['Undo Last Stroke',     '<Control>z'],
+                ['Undo Last Stroke',     '<Control>z', 'gradia-undo'],
                 ['Delete Selected',      'Delete BackSpace'],
                 ['Crop Tool',            '1 q'],
                 ['Drag Tool',            '2 d'],
@@ -248,7 +284,11 @@ const ShortcutsPage = GObject.registerClass(
             const group = new Adw.PreferencesGroup({ title });
             if (note)
                 group.set_description(note);
-            for (const [label, accel] of entries) {
+            for (const [label, accel, settingKey] of entries) {
+                if (settingKey) {
+                    group.add(this._makeEditableRow(label, settingKey));
+                    continue;
+                }
                 const row = new Adw.ActionRow({ title: label });
                 const shortcut = new Adw.ShortcutLabel({ accelerator: accel });
                 shortcut.set_valign(Gtk.Align.CENTER);
@@ -256,6 +296,98 @@ const ShortcutsPage = GObject.registerClass(
                 group.add(row);
             }
             this.add(group);
+        }
+
+        _makeEditableRow(label, settingKey) {
+            const row = new Adw.ActionRow({ title: label, activatable: true });
+
+            const shortcut = new Adw.ShortcutLabel({
+                accelerator: '',
+                disabled_text: 'Disabled',
+                valign: Gtk.Align.CENTER,
+            });
+
+            const restoreButton = new Gtk.Button({
+                icon_name: 'edit-undo-symbolic',
+                has_frame: false,
+                tooltip_text: 'Restore Default',
+                valign: Gtk.Align.CENTER,
+            });
+            restoreButton.add_css_class('circular');
+
+            row.add_suffix(restoreButton);
+            row.add_suffix(shortcut);
+
+            const update = () => {
+                const current = this._settings.get_strv(settingKey);
+                const def = this._settings.get_default_value(settingKey).deepUnpack();
+                shortcut.set_accelerator(current[0] ?? '');
+                const isDefault = current.length === def.length &&
+                    current.every((v, i) => v === def[i]);
+                restoreButton.set_visible(!isDefault);
+            };
+            update();
+            this._settings.connect(`changed::${settingKey}`, update);
+
+            restoreButton.connect('clicked', () => this._settings.reset(settingKey));
+            row.connect('activated', () => this._captureShortcut(settingKey, row));
+
+            return row;
+        }
+
+        _captureShortcut(settingKey, row) {
+            const dialog = new Adw.Dialog({
+                title: 'Set Shortcut',
+                content_width: 420,
+                content_height: 240,
+            });
+
+            const toolbarView = new Adw.ToolbarView();
+            toolbarView.add_top_bar(new Adw.HeaderBar());
+
+            const statusPage = new Adw.StatusPage({
+                icon_name: 'preferences-desktop-keyboard-shortcuts-symbolic',
+                title: 'Press a Shortcut',
+                description: 'Esc to cancel · Backspace to disable',
+            });
+            statusPage.add_css_class('compact');
+            statusPage.add_css_class('gradia-shortcut-status');
+            toolbarView.set_content(statusPage);
+            dialog.set_child(toolbarView);
+
+            // Require a modifier to avoid conflicting with text input.
+            const REQUIRED_MODS = Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK |
+                Gdk.ModifierType.SUPER_MASK | Gdk.ModifierType.META_MASK;
+
+            const keyController = new Gtk.EventControllerKey();
+            keyController.set_propagation_phase(Gtk.PropagationPhase.CAPTURE);
+            keyController.connect('key-pressed', (_controller, keyval, keycode, state) => {
+                let mask = state & Gtk.accelerator_get_default_mod_mask();
+                mask &= ~Gdk.ModifierType.LOCK_MASK;
+
+                if (keyval === Gdk.KEY_Escape && mask === 0) {
+                    dialog.close();
+                    return Gdk.EVENT_STOP;
+                }
+
+                if (keyval === Gdk.KEY_BackSpace && mask === 0) {
+                    this._settings.set_strv(settingKey, []);
+                    dialog.close();
+                    return Gdk.EVENT_STOP;
+                }
+
+                const key = latinKeyval(keyval, keycode);
+                if (!(mask & REQUIRED_MODS) || !Gtk.accelerator_valid(key, mask))
+                    return Gdk.EVENT_STOP;
+
+                const accel = Gtk.accelerator_name_with_keycode(null, key, keycode, mask);
+                this._settings.set_strv(settingKey, [accel]);
+                dialog.close();
+                return Gdk.EVENT_STOP;
+            });
+            dialog.add_controller(keyController);
+
+            dialog.present(row.get_root());
         }
 
         _addSystemKeybindingsGroup() {
@@ -290,6 +422,6 @@ export default class GradiaPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         const settings = this.getSettings();
         window.add(new AboutPage(settings));
-        window.add(new ShortcutsPage());
+        window.add(new ShortcutsPage(settings));
     }
 }

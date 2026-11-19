@@ -1,6 +1,9 @@
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 import Clutter from 'gi://Clutter';
+import Meta from 'gi://Meta';
+import Shell from 'gi://Shell';
 import Cairo from 'gi://cairo';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
@@ -8,12 +11,15 @@ import St from 'gi://St';
 
 import { Toolbar, TRASH_BUTTON_RADIUS } from './topBar.js';
 import { TOOLS, TOOL_SHORTCUTS } from './tools.js';
+import { shortcutKeyval } from './keys.js';
 import { GradiaSettings } from './settings.js';
 import { captureAndStoreScreenshot } from './screenshotStore.js';
 import { ResolutionOverlay } from './resolutionOverlay.js';
 import { isGradiaFlatpakInstalled, createOcrButton, createSettingsButton, launchGradiaOcrForFile, setOcrButtonEnabled } from './gradiaIntegration.js';
 import { destroyActiveToast } from './screenshotToast.js';
 import { SelectionClearer } from './selectionClearer.js';
+
+const SHELL_MAJOR = parseInt(Config.PACKAGE_VERSION, 10);
 
 const MAX_CANVAS_WIDTH = 1920;
 const MAX_CANVAS_HEIGHT = 1080;
@@ -24,6 +30,24 @@ const MODE_BUTTONS = [
     ['_screenButton',    '_screenButtonId'],
     ['_castButton',      '_castButtonId'],
 ];
+
+// Fix s, c, w, v, r, p shortcuts on other keyboard layouts.
+const MODE_KEY_ACTIONS = {
+    [Clutter.KEY_s]: ui => { ui._selectionButton.checked = true; },
+    [Clutter.KEY_c]: ui => { ui._screenButton.checked = true; },
+    [Clutter.KEY_w]: ui => { if (ui._windowButton.reactive) ui._windowButton.checked = true; },
+    [Clutter.KEY_v]: ui => { if (ui._castButton.reactive) ui._castButton.checked = !ui._castButton.checked; },
+    [Clutter.KEY_p]: ui => { ui._showPointerButton.checked = !ui._showPointerButton.checked; },
+    // GNOME 51+ uses 'r' to reset selection; earlier versions use it for Rectangle.
+    ...(SHELL_MAJOR >= 51
+        ? { [Clutter.KEY_r]: ui => { ui._areaSelector.resetArea(); } }
+        : {}),
+};
+
+const MODE_KEY_BLOCKING_MODS =
+    Clutter.ModifierType.CONTROL_MASK | Clutter.ModifierType.MOD1_MASK |
+    Clutter.ModifierType.SHIFT_MASK | Clutter.ModifierType.SUPER_MASK |
+    Clutter.ModifierType.META_MASK;
 
 export function setAreaSelectorHandlesVisible(selector, visible) {
     const handles = [
@@ -390,6 +414,8 @@ export default class GradiaCompanion extends Extension {
         this._bins = [];
         this._textEntry = null;
         this._pendingTextStroke = null;
+        this._registeredShortcuts = [];
+        this._filterKeybindingId = null;
 
         this._dragToolActive = false;
         this._dragToolStartX = 0;
@@ -1049,6 +1075,76 @@ export default class GradiaCompanion extends Extension {
         return Main.screenshotUI._castButton?.checked ?? false;
     }
 
+    _saveAsAndClose() {
+        this._captureScreenshot({ externalSave: true }).then(result => {
+            if (result !== undefined)
+                Main.screenshotUI.close();
+        });
+    }
+
+    // Configurable shortcuts (default: Ctrl+Z / C / S / E), registered with Mutter
+    // while the UI is open. Unavailable actions pass through via 'filter-keybinding';
+    // `key-press-event` remains as a fallback for defaults on non-Latin-only setups.
+    _shortcutActions() {
+        return {
+            'gradia-undo': {
+                available: () => true,
+                run: () => this._toolbar?.emit('undo'),
+            },
+            'gradia-copy': {
+                available: () => !this._textEntry && !this._isRecordingMode() && !this._portalMode,
+                run: () => this._copyOnlyAndClose(),
+            },
+            'gradia-save-as': {
+                available: () => !this._isRecordingMode(),
+                run: () => this._saveAsAndClose(),
+            },
+            'gradia-ocr': {
+                available: () => true,
+                run: () => this._ocrButton?.emit('clicked', 0),
+            },
+        };
+    }
+
+    _registerShortcuts() {
+        this._unregisterShortcuts();
+
+        const actions = this._shortcutActions();
+        for (const [name, action] of Object.entries(actions)) {
+            const id = Main.wm.addKeybinding(
+                name, this._settings, Meta.KeyBindingFlags.NONE,
+                Shell.ActionMode.POPUP, () => action.run());
+            if (id !== Meta.KeyBindingAction.NONE)
+                this._registeredShortcuts.push(name);
+        }
+
+        // Returning true here means "not handled": the key goes on to the shell.
+        this._filterKeybindingId = global.window_manager.connect(
+            'filter-keybinding', (_wm, binding) => {
+                const action = actions[binding.get_name()];
+                return action ? !action.available() : false;
+            });
+    }
+
+    _unregisterShortcuts() {
+        for (const name of this._registeredShortcuts ?? [])
+            Main.wm.removeKeybinding(name);
+        this._registeredShortcuts = [];
+
+        if (this._filterKeybindingId) {
+            global.window_manager.disconnect(this._filterKeybindingId);
+            this._filterKeybindingId = null;
+        }
+    }
+
+    _isDefaultShortcut(name) {
+        if (!this._settings)
+            return false;
+        const current = this._settings.get_strv(name);
+        const def = this._settings.get_default_value(name).deepUnpack();
+        return current.length === def.length && current.every((v, i) => v === def[i]);
+    }
+
     _updateVisibilityForMode() {
         const windowMode = this._isWindowMode();
         const selectionMode = Main.screenshotUI._selectionButton?.checked ?? false;
@@ -1298,33 +1394,32 @@ export default class GradiaCompanion extends Extension {
         this._resolutionOverlay = new ResolutionOverlay(primaryBin);
 
         this._keyPressId = Main.screenshotUI.connect('key-press-event', (_actor, event) => {
-            const sym = event.get_key_symbol();
+            // Fall back to the physical key.
+            const rawSym = event.get_key_symbol();
+            const sym = shortcutKeyval(event);
             const mods = event.get_state();
             const ctrl = mods & Clutter.ModifierType.CONTROL_MASK;
 
-            if (ctrl && sym === Clutter.KEY_z) {
+            if (ctrl && sym === Clutter.KEY_z && this._isDefaultShortcut('gradia-undo')) {
                 this._toolbar.emit('undo');
                 return Clutter.EVENT_STOP;
             }
 
-            if (ctrl && sym === Clutter.KEY_c) {
+            if (ctrl && sym === Clutter.KEY_c && this._isDefaultShortcut('gradia-copy')) {
                 if (!this._isRecordingMode() && !this._portalMode) {
                     this._copyOnlyAndClose();
                     return Clutter.EVENT_STOP;
                 }
             }
 
-            if (ctrl && sym === Clutter.KEY_s) {
+            if (ctrl && sym === Clutter.KEY_s && this._isDefaultShortcut('gradia-save-as')) {
                 if (!this._isRecordingMode()) {
-                    this._captureScreenshot({ externalSave: true }).then(result => {
-                        if (result !== undefined)
-                            Main.screenshotUI.close();
-                    });
+                    this._saveAsAndClose();
                     return Clutter.EVENT_STOP;
                 }
             }
 
-            if (ctrl && sym === Clutter.KEY_e) {
+            if (ctrl && sym === Clutter.KEY_e && this._isDefaultShortcut('gradia-ocr')) {
                 this._ocrButton?.emit('clicked', 0);
                 return Clutter.EVENT_STOP;
             }
@@ -1339,6 +1434,12 @@ export default class GradiaCompanion extends Extension {
                 }
             }
 
+            // Fallback for non-Latin layouts only.
+            if (rawSym !== sym && !(mods & MODE_KEY_BLOCKING_MODS) && sym in MODE_KEY_ACTIONS) {
+                MODE_KEY_ACTIONS[sym](Main.screenshotUI);
+                return Clutter.EVENT_STOP;
+            }
+
             if (!ctrl && sym in TOOL_SHORTCUTS) {
                 this._toolbar._onToolClicked(TOOL_SHORTCUTS[sym]);
                 return Clutter.EVENT_STOP;
@@ -1346,6 +1447,8 @@ export default class GradiaCompanion extends Extension {
 
             return Clutter.EVENT_PROPAGATE;
         });
+
+        this._registerShortcuts();
 
         // GNOME 51: ScreenshotUI binds Ctrl+C to "capture" (save + copy) through a
         // key-binding controller that runs before 'key-press-event'. Take Ctrl+C in
@@ -1356,7 +1459,7 @@ export default class GradiaCompanion extends Extension {
                 const [, sym] = controller.get_key();
                 const [, pressed, latched, locked] = controller.get_state();
                 const ctrl = (pressed | latched | locked) & Clutter.ModifierType.CONTROL_MASK;
-                if (!ctrl || sym !== Clutter.KEY_c)
+                if (!ctrl || sym !== Clutter.KEY_c || !this._isDefaultShortcut('gradia-copy'))
                     return Clutter.EVENT_PROPAGATE;
                 // Let the text entry keep its own Ctrl+C (copy selected text),
                 // and let the shell handle screencast / screenshot-only portal mode.
@@ -1437,6 +1540,8 @@ export default class GradiaCompanion extends Extension {
             Main.screenshotUI.disconnect(this._keyPressId);
             this._keyPressId = null;
         }
+
+        this._unregisterShortcuts();
 
         if (this._ctrlCController) {
             Main.screenshotUI.remove_action(this._ctrlCController);
